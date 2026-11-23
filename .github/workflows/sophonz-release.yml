@@ -1,0 +1,92 @@
+name: sophonz release
+
+# psmux.exe for st, from an upstream commit that psmux has not released yet.
+# st ships psmux inside its Windows binary (sophonz-tunnel-go tools/fetchpsmux)
+# and pins the zip this publishes by sha256.
+#
+# This lives on the fork's `sophonz` branch only, so master stays upstream's.
+# To release: put the upstream commit under this branch, tag, push the tag.
+#
+#   git switch sophonz && git rebase upstream/master
+#   git tag v3.4.0-sophonz.1 && git push origin sophonz v3.4.0-sophonz.1
+#
+# Signed with the organisation's Azure Artifact Signing, as st's own exe is.
+# Nothing is published unsigned: an unsigned psmux.exe is what Smart App
+# Control refuses to start. The trust is a federated credential for
+# repo:sophonz-labs@221816632/psmux@1434517989:environment:release.
+#
+# GitHub hosted, not the organisation's Windows machine: this repository is
+# public, and a fresh cargo build there is what Smart App Control blocks.
+
+on:
+  push:
+    tags: ['v*-sophonz.*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: build
+        run: |
+          cargo build --release --locked --bin psmux
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\psmux.exe dist\psmux.exe
+          & dist\psmux.exe -V
+
+      - uses: azure/artifact-signing-action@v2
+        with:
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          exclude-workload-identity-credential: false
+          exclude-azure-cli-credential: true
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\psmux.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Fail closed, and timestamped: the certificate lasts three days.
+      - name: the signature is really on it
+        run: |
+          $sig = Get-AuthenticodeSignature -LiteralPath dist\psmux.exe
+          if ($sig.Status -ne 'Valid') { throw "psmux.exe is not validly signed: $($sig.Status) $($sig.StatusMessage)" }
+          if (-not $sig.TimeStamperCertificate) { throw "psmux.exe is signed but not timestamped" }
+          "subject   $($sig.SignerCertificate.Subject)"
+          "timestamp $($sig.TimeStamperCertificate.Subject)"
+
+      # psmux.exe at the zip's root, the layout fetchpsmux reads.
+      - name: zip and sum
+        id: zip
+        run: |
+          Copy-Item LICENSE dist\LICENSE
+          $zip = "psmux-$env:TAG-windows-x64.zip"
+          Compress-Archive -Path dist\psmux.exe, dist\LICENSE -DestinationPath $zip
+          $sum = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$sum  $zip" | Set-Content -Encoding ascii "$zip.sha256"
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "sha256 $sum"
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIP: ${{ steps.zip.outputs.zip }}
+        run: |
+          $base = git rev-parse HEAD~1
+          gh release create $env:TAG $env:ZIP "$env:ZIP.sha256" --repo $env:GITHUB_REPOSITORY --prerelease --title "psmux $env:TAG for st" --notes "psmux.exe for st, built from upstream psmux/psmux $base plus this branch's release workflow. Signed by the sophonz-labs organisation."
